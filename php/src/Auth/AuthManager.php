@@ -1,4 +1,5 @@
 <?php
+declare(strict_types=1);
 
 namespace AIO\Auth;
 
@@ -15,16 +16,17 @@ readonly class AuthManager {
     }
 
     public function CheckCredentials(string $password) : bool {
-        return hash_equals($this->configurationManager->GetPassword(), $password);
+        return hash_equals($this->configurationManager->password, $password);
     }
 
     public function CheckToken(string $token) : bool {
-        return hash_equals($this->configurationManager->GetToken(), $token);
+        return hash_equals($this->configurationManager->aioToken, $token);
     }
 
     public function SetAuthState(bool $isLoggedIn) : void {
 
         if (!$this->IsAuthenticated() && $isLoggedIn === true) {
+            session_regenerate_id(true);
             $date = new DateTime();
             $dateTime = $date->getTimestamp();
             $_SESSION['date_time'] = $dateTime;

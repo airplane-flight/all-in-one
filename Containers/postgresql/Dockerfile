@@ -1,17 +1,20 @@
 # syntax=docker/dockerfile:latest
-# From https://github.com/docker-library/postgres/blob/master/16/alpine3.20/Dockerfile
-FROM postgres:16.4-alpine
+# From https://github.com/docker-library/postgres/blob/master/18/alpine3.24/Dockerfile
+FROM postgres:18.6-alpine
+
+ENV PGDATA=/var/lib/postgresql/data
 
 COPY --chmod=775 start.sh /start.sh
 COPY --chmod=775 healthcheck.sh /healthcheck.sh
 COPY --chmod=775 init-user-db.sh /docker-entrypoint-initdb.d/init-user-db.sh
 
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 RUN set -ex; \
     apk upgrade --no-cache -a; \
     apk add --no-cache \
         bash \
-        openssl \
         shadow \
+        netcat-openbsd \
         grep; \
     \
 # We need to use the same gid and uid as on old installations
@@ -22,6 +25,7 @@ RUN set -ex; \
     apk del --no-cache shadow; \
     \
 # Fix default permissions
+    mkdir -p /var/lib/postgresql/data; \
     chown -R postgres:postgres /var/lib/postgresql; \
     chown -R postgres:postgres /var/run/postgresql; \
     chmod -R 777 /var/run/postgresql; \
@@ -30,17 +34,21 @@ RUN set -ex; \
     mkdir /mnt/data; \
     chown postgres:postgres /mnt/data; \
     \
-# Give root a random password
-    echo "root:$(openssl rand -base64 12)" | chpasswd; \
-    apk --no-cache del openssl; \
-    \
 # Get rid of unused binaries
     rm -f /usr/local/bin/gosu /usr/local/bin/su-exec;
 
 VOLUME /mnt/data
 
-USER postgres
+USER postgres:postgres
 ENTRYPOINT ["/start.sh"]
 
-HEALTHCHECK CMD /healthcheck.sh
-LABEL com.centurylinklabs.watchtower.enable="false"
+HEALTHCHECK CMD ["/healthcheck.sh"]
+LABEL com.centurylinklabs.watchtower.enable="false" \
+    wud.watch="false" \
+    dockhand.update="false" \
+    org.opencontainers.image.title="PostgreSQL for Nextcloud AIO" \
+    org.opencontainers.image.description="PostgreSQL database for Nextcloud All-in-One" \
+    org.opencontainers.image.url="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.source="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.vendor="Nextcloud" \
+    org.opencontainers.image.documentation="https://github.com/nextcloud/all-in-one/blob/main/readme.md"

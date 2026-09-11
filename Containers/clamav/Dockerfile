@@ -1,26 +1,57 @@
 # syntax=docker/dockerfile:latest
-# Probably from this file: https://github.com/Cisco-Talos/clamav-docker/blob/main/clamav/1.3/alpine/Dockerfile
-FROM clamav/clamav:1.4.1-7
-
-COPY clamav.conf /clamav.conf
-COPY --chmod=775 start.script /start.script
+FROM alpine:3.24.1
 
 RUN set -ex; \
     apk upgrade --no-cache -a; \
-    apk add --no-cache tzdata bash; \
-    mkdir -p /var/run/clamav /run/lock; \
-    chown -R clamav:clamav /var/run/clamav /run/clamav /var/log/clamav /var/lock /run/lock; \
-    chmod 777 -R /var/run/clamav /run/clamav /var/log/clamav /var/lock /run/lock /tmp; \
-    sed -i "/^set -eu/r /start.script" /init-unprivileged; \
-    rm /start.script; \
-    grep -q 'clamd --foreground &' /init-unprivileged; \
-    sed -i "s|clamd --foreground \&|clamd --foreground --config-file /tmp/clamd.conf \&|" /init-unprivileged; \
-    cat /init-unprivileged
+    apk add --no-cache tzdata clamav clamav-milter dinit bash; \
+    mkdir -p /tmp /var/lib/clamav; \
+    chmod 777 -R /tmp /var/log/clamav; \
+    chmod 777 /run; \
+    chown -R clamav:clamav /var/lib/clamav; \
+    sed -i "s|#\?MaxDirectoryRecursion.*|MaxDirectoryRecursion 30|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?MaxScanSize.*|MaxScanSize 2000M|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?MaxFileSize.*|MaxFileSize 2000M|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?PCREMaxFileSize.*|PCREMaxFileSize 2000M|g" /etc/clamav/clamd.conf; \
+# StreamMaxLength must be synced with av_stream_max_length inside the Nextcloud files_antivirus plugin
+    sed -i "s|#\?StreamMaxLength.*|StreamMaxLength 2000M|g" /etc/clamav/clamd.conf; \
+# By default clamd keeps the old signature database in RAM while loading the new one,
+# briefly doubling memory usage (~1 GB extra) during each freshclam update cycle.
+# Setting ConcurrentDatabaseReload to "no" makes clamd unload the old database first,
+# eliminating that transient peak and significantly reducing maximum RAM consumption.
+    sed -i "s|#\?ConcurrentDatabaseReload.*|ConcurrentDatabaseReload no|g" /etc/clamav/clamd.conf; \
+# The default thread pool is 10-12 threads, each reserving its own stack and scan buffers.
+# The Nextcloud antivirus plugin sends one file at a time, so 2 threads are sufficient
+# and avoids the idle per-thread memory overhead of the larger default pool.
+    sed -i "s|#\?MaxThreads.*|MaxThreads 2|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?TCPSocket|TCPSocket|g" /etc/clamav/clamd.conf; \
+    sed -i "s|^LocalSocket .*|LocalSocket /tmp/clamd.sock|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?PidFile .*|PidFile /tmp/clamd.pid|g" /etc/clamav/clamd.conf; \
+    sed -i "s|#\?PidFile .*|PidFile /tmp/freshclam.pid|g" /etc/clamav/freshclam.conf; \
+    sed -i "s|Example| |g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?MilterSocket inet:7357|MilterSocket inet:7357|g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?ClamdSocket unix:/run/clamav/clamd.sock|ClamdSocket unix:/tmp/clamd.sock|g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?PidFile .*|PidFile /tmp/clamav-milter.pid|g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?OnInfected Quarantine|OnInfected Reject|g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?AddHeader Replace|AddHeader Add|g" /etc/clamav/clamav-milter.conf; \
+    sed -i "s|#\?Foreground yes|Foreground yes|g" /etc/clamav/clamav-milter.conf
 
+COPY --chmod=775 start.sh /start.sh
+COPY --chmod=775 healthcheck.sh /healthcheck.sh
+COPY dinit.d/ /etc/dinit.d/
+
+USER clamav:clamav
+RUN set -ex; \
+    freshclam --foreground --stdout
 VOLUME /var/lib/clamav
-
-USER clamav
-
-LABEL com.centurylinklabs.watchtower.enable="false"
-
-ENTRYPOINT ["/init-unprivileged"]
+ENTRYPOINT ["/start.sh"]
+CMD ["dinit", "--system", "--container", "freshclam", "clamd", "milter"]
+LABEL com.centurylinklabs.watchtower.enable="false" \
+    wud.watch="false" \
+    dockhand.update="false" \
+    org.opencontainers.image.title="ClamAV for Nextcloud AIO" \
+    org.opencontainers.image.description="ClamAV antivirus scanner for Nextcloud All-in-One" \
+    org.opencontainers.image.url="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.source="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.vendor="Nextcloud" \
+    org.opencontainers.image.documentation="https://github.com/nextcloud/all-in-one/blob/main/readme.md"
+HEALTHCHECK --start-period=60s --retries=9 CMD ["/healthcheck.sh"]

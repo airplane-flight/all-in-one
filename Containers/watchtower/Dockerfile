@@ -1,19 +1,36 @@
 # syntax=docker/dockerfile:latest
-# From https://github.com/containrrr/watchtower/blob/main/dockerfiles/Dockerfile.self-contained
-FROM containrrr/watchtower:1.7.1 AS watchtower
+FROM golang:1.27.0-alpine3.24 AS go
 
-FROM alpine:3.20.3
+ENV WATCHTOWER_COMMIT_HASH=bafcfa83eea47138851982cd0bdd14b8ad334919	
 
 RUN set -ex; \
     apk upgrade --no-cache -a; \
-    apk add --no-cache bash
+    apk add --no-cache \
+        build-base; \
+    go install github.com/nicholas-fedor/watchtower@$WATCHTOWER_COMMIT_HASH # v1.21.2
 
-COPY --from=watchtower /watchtower /watchtower
+FROM alpine:3.24.1
+
+RUN set -ex; \
+    apk upgrade --no-cache -a; \
+    apk add --no-cache bash ca-certificates tzdata
+
+COPY --from=go /go/bin/watchtower /watchtower
 
 COPY --chmod=775 start.sh /start.sh
 
 # hadolint ignore=DL3002
-USER root
+USER root:root
+
+ENV AIO_LOG_LEVEL="warn"
 
 ENTRYPOINT ["/start.sh"]
-LABEL com.centurylinklabs.watchtower.enable="false"
+LABEL com.centurylinklabs.watchtower.enable="false" \
+    wud.watch="false" \
+    dockhand.update="false" \
+    org.opencontainers.image.title="Watchtower for Nextcloud AIO" \
+    org.opencontainers.image.description="Watchtower auto-update service for Nextcloud All-in-One containers" \
+    org.opencontainers.image.url="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.source="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.vendor="Nextcloud" \
+    org.opencontainers.image.documentation="https://github.com/nextcloud/all-in-one/blob/main/readme.md"

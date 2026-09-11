@@ -149,7 +149,7 @@ apt install --no-install-recommends qemu-system qemu-utils libvirt-clients libvi
    --env TALK_PORT=3478 \
    --volume nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
    --volume /var/run/docker.sock:/var/run/docker.sock:ro \
-   nextcloud/all-in-one:latest
+   ghcr.io/nextcloud-releases/all-in-one:latest
    ```
    The last command may take a few minutes. When it's finished, you should see a success message, saying "Initial startup of Nextcloud All-in-One complete!". Now exit the console session with `Ctrl + [c]`. This concludes the setup for this particular VM.
 
@@ -180,6 +180,7 @@ apt install --no-install-recommends qemu-system qemu-utils libvirt-clients libvi
     # Virtual machine #1 - "example1-com"
     https://[DOMAIN_NAME_1]:8443 {
         reverse_proxy https://[IP_ADDRESS_1]:8080 {
+            header_up Host {host}
             transport http {
                 tls_insecure_skip_verify
             }
@@ -192,6 +193,7 @@ apt install --no-install-recommends qemu-system qemu-utils libvirt-clients libvi
     # Virtual machine #2 - "example2-com"
     https://[DOMAIN_NAME_2]:8443 {
         reverse_proxy https://[IP_ADDRESS_2]:8080 {
+            header_up Host {host}
             transport http {
                 tls_insecure_skip_verify
             }

@@ -11,8 +11,9 @@ jobs:
     name: Run nextcloud-update script
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - name: Run nextcloud-update script
+      id: nextcloud_update
       run: |
         # Inspired by https://github.com/nextcloud/docker/blob/master/update.sh
 
@@ -51,7 +52,7 @@ jobs:
         
         # Imagick
         imagick_version="$(
-          git ls-remote --tags https://github.com/Imagick/imagick.git \
+          git ls-remote --tags https://github.com/imagick/imagick.git \
             | cut -d/ -f3 \
             | grep -viE '[a-z]' \
             | tr -d '^{}' \
@@ -77,14 +78,19 @@ jobs:
         if [ -n "$NCVERSION" ]; then
           sed -i "s|^ENV NEXTCLOUD_VERSION.*|ENV NEXTCLOUD_VERSION=$NCVERSION|" ./Containers/nextcloud/Dockerfile
         fi
+        echo "nc_version=$NCVERSION" >> "$GITHUB_OUTPUT"
 
     - name: Create Pull Request
-      uses: peter-evans/create-pull-request@v7
+      uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v7
       with:
+        token: ${{ secrets.GITHUB_TOKEN }}
         commit-message: nextcloud-update automated change
         signoff: true
-        title: Nextcloud dependency update
-        body: Automated Nextcloud container update
+        title: Nextcloud dependency update to ${{ steps.nextcloud_update.outputs.nc_version }}
+        body: |
+          Automated Nextcloud container update to version ${{ steps.nextcloud_update.outputs.nc_version }}.
+
+          See the [Nextcloud Server ${{ steps.nextcloud_update.outputs.nc_version }} release notes](https://github.com/nextcloud/server/releases/tag/v${{ steps.nextcloud_update.outputs.nc_version }}) for details.
         labels: dependencies, 3. to review
         milestone: next
         branch: nextcloud-container-update

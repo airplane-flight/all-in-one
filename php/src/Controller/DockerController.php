@@ -1,29 +1,37 @@
 <?php
+declare(strict_types=1);
 
 namespace AIO\Controller;
 
+use AIO\Container\Container;
 use AIO\Container\ContainerState;
 use AIO\ContainerDefinitionFetcher;
+use AIO\Desec\DesecManager;
 use AIO\Docker\DockerActionManager;
 use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
 use AIO\Data\ConfigurationManager;
+use AIO\Data\OfficeSuite;
+use Slim\Psr7\NonBufferedBody;
 
 readonly class DockerController {
     private const string TOP_CONTAINER = 'nextcloud-aio-apache';
+    private const string LATEST_MAJOR_VERSION = '35';
 
     public function __construct(
         private DockerActionManager           $dockerActionManager,
         private ContainerDefinitionFetcher    $containerDefinitionFetcher,
-        private ConfigurationManager $configurationManager
+        private ConfigurationManager $configurationManager,
+        private DesecManager $desecManager,
     ) {
     }
 
-    private function PerformRecursiveContainerStart(string $id, bool $pullImage = true) : void {
+    private function PerformRecursiveContainerStart(string $id, bool $pullImage = true, ?\Closure $addToStreamingResponseBody = null) : void {
         $container = $this->containerDefinitionFetcher->GetContainerById($id);
 
-        foreach($container->GetDependsOn() as $dependency) {
-            $this->PerformRecursiveContainerStart($dependency, $pullImage);
+        // Start all dependencies first and then itself
+        foreach($container->dependsOn as $dependency) {
+            $this->PerformRecursiveContainerStart($dependency, $pullImage, $addToStreamingResponseBody);
         }
 
         // Don't start if container is already running
@@ -33,38 +41,42 @@ readonly class DockerController {
             return;
         }
 
-        // Skip database image pull if the last shutdown was not clean
-        if ($id === 'nextcloud-aio-database') {
-            if ($this->dockerActionManager->GetDatabasecontainerExitCode() > 0) {
-                $pullImage = false;
-                error_log('Not pulling the latest database image because the container was not correctly shut down.');
-            }
-        }
-
-        // Check if docker hub is reachable in order to make sure that we do not try to pull an image if it is down
-        // and try to mitigate issues that are arising due to that
-        if ($pullImage) {
-            if (!$this->dockerActionManager->isDockerHubReachable($container)) {
-                $pullImage = false;
-                error_log('Not pulling the image for the ' . $container->GetContainerName() . ' container because docker hub does not seem to be reachable.');
-            }
-        }
-
         $this->dockerActionManager->DeleteContainer($container);
         $this->dockerActionManager->CreateVolumes($container);
-        if ($pullImage) {
-            $this->dockerActionManager->PullImage($container);
-        }
+        $this->dockerActionManager->PullImage($container, $pullImage, $addToStreamingResponseBody);
         $this->dockerActionManager->CreateContainer($container);
-        $this->dockerActionManager->StartContainer($container);
+        $this->dockerActionManager->StartContainer($container, $addToStreamingResponseBody);
         $this->dockerActionManager->ConnectContainerToNetwork($container);
+    }
+
+    private function PerformRecursiveImagePull(string $id) : void {
+        $container = $this->containerDefinitionFetcher->GetContainerById($id);
+
+        // Pull all dependencies first and then itself
+        foreach($container->dependsOn as $dependency) {
+            $this->PerformRecursiveImagePull($dependency);
+        }
+
+        $this->dockerActionManager->PullImage($container, true);
+    }
+
+    public function PullAllContainerImages(): void {
+
+        $id = self::TOP_CONTAINER;
+
+        $this->PerformRecursiveImagePull($id);
     }
 
     public function GetLogs(Request $request, Response $response, array $args) : Response
     {
-        $id = $request->getQueryParams()['id'];
+        $requestParams = $request->getQueryParams();
+        $id = '';
+        if (isset($requestParams['id']) && is_string($requestParams['id'])) {
+            $id = $requestParams['id'];
+        }
         if (str_starts_with($id, 'nextcloud-aio-')) {
-            $logs = $this->dockerActionManager->GetLogs($id);
+            $since = $this->getTimestampForDockerLogsApiSince($requestParams['since'] ?? '');
+            $logs = $this->dockerActionManager->GetLogs($id, $since);
         } else {
             $logs = 'Container not found.';
         }
@@ -79,80 +91,126 @@ readonly class DockerController {
     }
 
     public function StartBackupContainerBackup(Request $request, Response $response, array $args) : Response {
-        $this->startBackup();
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $forceStopNextcloud = true;
+        $this->startBackup($forceStopNextcloud, $addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
-    public function startBackup() : void {
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'backup';
-        $this->configurationManager->WriteConfig($config);
+    public function startBackup(bool $forceStopNextcloud = false, ?\Closure $addToStreamingResponseBody = null) : void {
+        $this->configurationManager->backupMode = 'backup';
 
         $id = self::TOP_CONTAINER;
-        $this->PerformRecursiveContainerStop($id);
+        $this->PerformRecursiveContainerStop($id, $forceStopNextcloud, $addToStreamingResponseBody);
 
         $id = 'nextcloud-aio-borgbackup';
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
     }
 
     public function StartBackupContainerCheck(Request $request, Response $response, array $args) : Response {
-        $this->checkBackup();
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $this->checkBackup($addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
-    public function checkBackup() : void {
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'check';
-        $this->configurationManager->WriteConfig($config);
+    public function StartBackupContainerList(Request $request, Response $response, array $args) : Response {
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $this->listBackup($addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
+    }
+
+    public function checkBackup(?\Closure $addToStreamingResponseBody = null) : void {
+        $this->configurationManager->backupMode = 'check';
 
         $id = 'nextcloud-aio-borgbackup';
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
+    }
+
+    private function listBackup(?\Closure $addToStreamingResponseBody = null) : void {
+        $this->configurationManager->backupMode = 'list';
+
+        $id = 'nextcloud-aio-borgbackup';
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
     }
 
     public function StartBackupContainerRestore(Request $request, Response $response, array $args) : Response {
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'restore';
-        $config['selected-restore-time'] = $request->getParsedBody()['selected_restore_time'] ?? '';
-        $this->configurationManager->WriteConfig($config);
+        $this->configurationManager->startTransaction();
+        $this->configurationManager->backupMode = 'restore';
+        $this->configurationManager->selectedRestoreTime = $request->getParsedBody()['selected_restore_time'] ?? '';
+        $this->configurationManager->restoreExcludePreviews = isset($request->getParsedBody()['restore-exclude-previews']);
+        $this->configurationManager->commitTransaction();
+
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
 
         $id = self::TOP_CONTAINER;
-        $this->PerformRecursiveContainerStop($id);
+        $forceStopNextcloud = true;
+        $this->PerformRecursiveContainerStop($id, $forceStopNextcloud, $addToStreamingResponseBody);
 
         $id = 'nextcloud-aio-borgbackup';
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
 
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
     public function StartBackupContainerCheckRepair(Request $request, Response $response, array $args) : Response {
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'check-repair';
-        $this->configurationManager->WriteConfig($config);
+        $this->configurationManager->backupMode = 'check-repair';
+
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
 
         $id = 'nextcloud-aio-borgbackup';
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
 
         // Restore to backup check which is needed to make the UI logic work correctly
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'check';
-        $this->configurationManager->WriteConfig($config);
+        $this->configurationManager->backupMode = 'check';
 
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
     public function StartBackupContainerTest(Request $request, Response $response, array $args) : Response {
-        $config = $this->configurationManager->GetConfig();
-        $config['backup-mode'] = 'test';
-        $config['instance_restore_attempt'] = 0;
-        $this->configurationManager->WriteConfig($config);
+        $this->configurationManager->startTransaction();
+        $this->configurationManager->backupMode = 'test';
+        $this->configurationManager->instanceRestoreAttempt = false;
+        $this->configurationManager->commitTransaction();
+
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
 
         $id = self::TOP_CONTAINER;
-        $this->PerformRecursiveContainerStop($id);
+        $this->PerformRecursiveContainerStop($id, true, $addToStreamingResponseBody);
 
         $id = 'nextcloud-aio-borgbackup';
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
 
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
     public function StartContainer(Request $request, Response $response, array $args) : Response
@@ -160,79 +218,158 @@ readonly class DockerController {
         $uri = $request->getUri();
         $host = $uri->getHost();
         $port = $uri->getPort();
+        $path = $request->getParsedBody()['base_path'] ?? '';
         if ($port === 8000) {
             error_log('The AIO_URL-port was discovered to be 8000 which is not expected. It is now set to 443.');
             $port = 443;
         }
 
         if (isset($request->getParsedBody()['install_latest_major'])) {
-            $installLatestMajor = 30;
+            $installLatestMajor = self::LATEST_MAJOR_VERSION;
         } else {
-            $installLatestMajor = "";
+            $installLatestMajor = '';
         }
-
-        $config = $this->configurationManager->GetConfig();
+        
+        $this->configurationManager->startTransaction();
+        $this->configurationManager->installLatestMajor = $installLatestMajor;
         // set AIO_URL
-        $config['AIO_URL'] = $host . ':' . $port;
+        $this->configurationManager->aioUrl = $host . ':' . (string)$port . $path;
         // set wasStartButtonClicked
-        $config['wasStartButtonClicked'] = 1;
-        // set install_latest_major
-        $config['install_latest_major'] = $installLatestMajor;
-        $this->configurationManager->WriteConfig($config);
-
+        $this->configurationManager->wasStartButtonClicked = true;
+        $this->configurationManager->commitTransaction();
+        
+        // Do not pull container images in case 'bypass_container_update' is set via url params
+        // Needed for local testing
+        $pullImage = !isset($request->getParsedBody()['bypass_container_update']);
+        if ($pullImage === false) {
+            error_log('WARNING: Not pulling container images. Instead, using local ones.');
+        }
+        
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+        
         // Start container
-        $this->startTopContainer(true);
+        $this->startTopContainer($pullImage, $addToStreamingResponseBody);
 
         // Clear apcu cache in order to check if container updates are available
         // Temporarily disabled as it leads much faster to docker rate limits
         // apcu_clear_cache();
 
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
-    public function startTopContainer(bool $pullImage) : void {
-        $config = $this->configurationManager->GetConfig();
-        // set AIO_TOKEN
-        $config['AIO_TOKEN'] = bin2hex(random_bytes(24));
-        $this->configurationManager->WriteConfig($config);
+    public function startTopContainer(bool $pullImage, ?\Closure $addToStreamingResponseBody = null) : void {
+        $this->configurationManager->aioToken = bin2hex(random_bytes(24));
 
         // Stop domaincheck since apache would not be able to start otherwise
         $this->StopDomaincheckContainer();
 
+        // Refresh the deSEC DNS record with the current public IP before starting containers
+        $this->desecManager->updateIpIfDesecDomain();
+
         $id = self::TOP_CONTAINER;
 
-        $this->PerformRecursiveContainerStart($id, $pullImage);
+        $this->PerformRecursiveContainerStart($id, $pullImage, $addToStreamingResponseBody);
     }
 
     public function StartWatchtowerContainer(Request $request, Response $response, array $args) : Response {
-        $this->startWatchtower();
-        return $response->withStatus(201)->withHeader('Location', '/');
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $this->startWatchtower($addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
-    public function startWatchtower() : void {
+    public function startWatchtower(?\Closure $addToStreamingResponseBody = null) : void {
         $id = 'nextcloud-aio-watchtower';
 
-        $this->PerformRecursiveContainerStart($id);
+        $this->PerformRecursiveContainerStart($id, true, $addToStreamingResponseBody);
     }
 
-    private function PerformRecursiveContainerStop(string $id) : void
+    private function PerformRecursiveContainerStop(string $id, bool $forceStopNextcloud = false, ?\Closure $addToStreamingResponseBody = null) : void
     {
         $container = $this->containerDefinitionFetcher->GetContainerById($id);
-        foreach($container->GetDependsOn() as $dependency) {
-            $this->PerformRecursiveContainerStop($dependency);
+
+        // This is a hack but no better solution was found for the meantime
+        // Stop Collabora first to make sure it force-saves
+        // See https://github.com/nextcloud/richdocuments/issues/3799
+        if ($id === self::TOP_CONTAINER && $this->configurationManager->officeSuite === OfficeSuite::Collabora) {
+            $this->PerformRecursiveContainerStop('nextcloud-aio-collabora', false, $addToStreamingResponseBody);
         }
 
-        // Disconnecting is not needed. This also allows to start the containers manually via docker-cli
-        //$this->dockerActionManager->DisconnectContainerFromNetwork($container);
-        $this->dockerActionManager->StopContainer($container);
+        if ($addToStreamingResponseBody !== null) {
+            $addToStreamingResponseBody("Stopping container", $container);
+        }
+
+        // Stop itself first and then all the dependencies
+        if ($id !== 'nextcloud-aio-nextcloud') {
+            $this->dockerActionManager->StopContainer($container);
+        } else {
+            // We want to stop the Nextcloud container after 10s and not wait for the configured stop_grace_period
+            $this->dockerActionManager->StopContainer($container, $forceStopNextcloud);
+        }
+        foreach($container->dependsOn as $dependency) {
+            $this->PerformRecursiveContainerStop($dependency, $forceStopNextcloud, $addToStreamingResponseBody);
+        }
     }
 
     public function StopContainer(Request $request, Response $response, array $args) : Response
     {
-        $id = self::TOP_CONTAINER;
-        $this->PerformRecursiveContainerStop($id);
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
 
-        return $response->withStatus(201)->withHeader('Location', '/');
+        $id = self::TOP_CONTAINER;
+        $forceStopNextcloud = true;
+        $this->PerformRecursiveContainerStop($id, $forceStopNextcloud, $addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
+    }
+
+    public function DeleteBorgBackupConfig(Request $request, Response $response, array $args) : Response {
+        $this->dockerActionManager->deleteBorgBackupConfig();
+        return $response->withStatus(201)->withHeader('Location', '.');
+    }
+
+    public function RunNextcloudUpgradeToLatestMajor(Request $request, Response $response, array $args) : Response {
+        $this->configurationManager->installLatestMajor = self::LATEST_MAJOR_VERSION;
+
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $this->dockerActionManager->RunNextcloudUpgradeToLatestMajor($addToStreamingResponseBody);
+
+        // We automatically reload after 10s so that the output can be read or copied if necessary 
+        $addToStreamingResponseBody("Automatically reloading the page after 10s."); 
+        sleep(10); 
+ 
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
+    }
+
+    public function SystemPrune(Request $request, Response $response, array $args) : Response {
+        // Get streaming response start and closure
+        $nonbufResp = $this->startStreamingResponse($response);
+
+        $body = $nonbufResp->getBody();
+        $addToStreamingResponseBody = $this->getAddToStreamingResponseBody($nonbufResp);
+
+        $this->dockerActionManager->SystemPrune($addToStreamingResponseBody);
+
+        // End streaming response
+        $this->finalizeStreamingResponse($nonbufResp);
+        return $nonbufResp;
     }
 
     public function stopTopContainer() : void {
@@ -243,7 +380,7 @@ readonly class DockerController {
     public function StartDomaincheckContainer() : void
     {
         # Don't start if domain is already set
-        if ($this->configurationManager->GetDomain() !== '' || $this->configurationManager->wasStartButtonClicked()) {
+        if ($this->configurationManager->domain !== '' || $this->configurationManager->wasStartButtonClicked) {
             return;
         }
 
@@ -280,5 +417,105 @@ readonly class DockerController {
     {
         $id = 'nextcloud-aio-domaincheck';
         $this->PerformRecursiveContainerStop($id);
+    }
+
+    private function getStreamingResponseHtmlStart() : string {
+        return <<<END
+        <!DOCTYPE html>
+        <html lang="en" class="overlay-iframe">
+            <head>
+                <link rel="stylesheet" href="../../style.css?v12" media="all" />
+                <script type="text/javascript" src="../../apply-theme.js?v1"></script>
+                <script type="text/javascript" src="../../scroll-into-view.js?v1"></script>
+            </head>
+            <body>
+            
+        END;
+    }
+
+    private function startStreamingResponse(Response $response) : Response {
+        // Ensure the script keeps running even if the client connection drops (e.g. due to a
+        // reverse proxy read timeout during a long image pull). Without this, PHP would abort
+        // on the first write after the connection is gone, leaving only some containers started.
+        ignore_user_abort(true);
+
+        $nonbufResp = $response
+            ->withBody(new NonBufferedBody())
+            ->withHeader('Content-Type', 'text/html; charset=utf-8')
+            ->withHeader('X-Accel-Buffering', 'no')
+            ->withHeader('Content-Length', '-1')
+            ->withHeader('Cache-Control', 'no-cache');
+            
+        // Text written into this body is immediately sent to the client, without waiting for later content.
+        $streamingResponseBody = $nonbufResp->getBody();
+        
+        $streamingResponseBody->write($this->getStreamingResponseHtmlStart());
+
+        return $nonbufResp;
+    }
+
+    private function getAddToStreamingResponseBody(Response $nonbufResp) : \Closure {
+        // Create a closure to pass around to the code, which should to the logging (because it e.g. decides
+        // if it'll actually pull an image), but which should not need to know anything about the
+        // wanted markup or formatting.
+        $addToStreamingResponseBody = function (string $message, ?Container $container = null) use ($nonbufResp) : void {
+            // If the message is a single dot we treat it as a progress indicator and send a specific, empty
+            // HTML element, which gets special treatment by the Javascript code.
+            if ($message === '.') {
+                $html = "<span class='progress-indicator'></span>";
+            } else {
+                // Strip ANSI codes. If the operation fails, use the unchanged $message as fallback.
+                $text = preg_replace('/\e[[][A-Za-z0-9];?[0-9]*m?/', '', $message) ?? $message;
+                if ($container) {
+                    $text = sprintf("%s: %s", $container->displayName, $text);
+                }
+                $html = sprintf("<div>%s</div>", htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'));
+            }
+            $nonbufResp->getBody()->write($html);
+        };
+
+        return $addToStreamingResponseBody;
+    }
+
+    private function finalizeStreamingResponse(Response $nonbufResp) : void {
+        $nonbufResp->getBody()->write($this->getStreamingResponseHtmlEnd());
+    }
+
+    private function getStreamingResponseHtmlEnd() : string {
+        return "\n  </body>\n</html>";
+    }
+
+    private function getTimestampForDockerLogsApiSince(string $input) : string
+    {
+        if ($input === '') {
+            return '';
+        }
+
+        // We expect an RFC3339Nano string with Timezone UTC here, as docker will put out.
+        // Unfortunately PHP doesn't support this format with nanoseconds, so we have to help
+        // ourselves a little bit.
+        // First we split off the nanoseconds.
+        preg_match('/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\.(\d{9}).*/', $input, $match);
+        if (count($match) !== 3) {
+            // The input doesn't match our expectations, it might be manipulated, we ignore it.
+            return '';
+        }
+
+        $datetime = \DateTimeImmutable::createFromFormat("Y-m-d\\TH:i:s", $match[1]);
+        $nanoseconds = $match[2];
+
+        if ($datetime === false) {
+            // Input was not parseable, it might be manipulated, we ignore it.
+            return '';
+        }
+
+        // Format the datetime as unix timestamp.
+        $timestamp = $datetime->format('U');
+
+        // Increase the nanoseconds by 1, so we don't get the line with exactly the original datetime again.
+        $nanoseconds = strval(intval($nanoseconds) + 1);
+
+        // Now append the nanoseconds to the timestamp-string.
+        return "{$timestamp}.{$nanoseconds}";
     }
 }

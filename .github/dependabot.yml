@@ -1,34 +1,43 @@
 version: 2
 updates:
 - package-ecosystem: "github-actions"
-  directory: "/"
+  directory: ".github/workflows"
   schedule:
     interval: "daily"
     time: "12:00"
   open-pull-requests-limit: 10
+  rebase-strategy: "disabled"
+  labels:
+  - 3. to review
+  - dependencies
+  cooldown:
+    default-days: 7
 - package-ecosystem: composer
   directory: "/php/"
   schedule:
     interval: "daily"
     time: "12:00"
   open-pull-requests-limit: 10
+  rebase-strategy: "auto"
   labels:
   - 3. to review
   - dependencies
 - package-ecosystem: "docker"
   directories:
+    - "/Containers/alpine"
     - "/Containers/apache"
     - "/Containers/borgbackup"
     - "/Containers/clamav"
     - "/Containers/collabora"
     - "/Containers/docker-socket-proxy"
     - "/Containers/domaincheck"
+    - "/Containers/eurooffice"
     - "/Containers/fulltextsearch"
+    - "/Containers/harp"
     - "/Containers/imaginary"
     - "/Containers/mastercontainer"
     - "/Containers/nextcloud"
     - "/Containers/notify-push"
-    - "/Containers/onlyoffice"
     - "/Containers/postgresql"
     - "/Containers/redis"
     - "/Containers/talk"
@@ -39,6 +48,7 @@ updates:
     interval: "daily"
     time: "04:00"
   open-pull-requests-limit: 10
+  rebase-strategy: "disabled"
   labels:
   - 3. to review
   - dependencies
@@ -48,6 +58,6 @@ updates:
     - dependency-name: "postgres"
       update-types: ["version-update:semver-major"]
     - dependency-name: "redis"
-      update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      update-types: ["version-update:semver-major"]
     - dependency-name: "elasticsearch"
       update-types: ["version-update:semver-major"]

@@ -16,3 +16,12 @@ $CONFIG = array (
 if (getenv('APPS_ALLOWLIST')) {
     $CONFIG['appsallowlist'] = explode(" ", getenv('APPS_ALLOWLIST'));
 }
+
+$appStoreUrl = getenv('NEXTCLOUD_APP_STORE_URL');
+if ($appStoreUrl) {
+    if ($appStoreUrl === 'no') {
+        $CONFIG['appstoreenabled '] = false;
+    } else {
+        $CONFIG['appstoreurl'] = getenv('NEXTCLOUD_APP_STORE_URL');
+    }
+}

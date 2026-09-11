@@ -1,5 +1,9 @@
 #!/bin/bash
 
+if [ "$AIO_LOG_LEVEL" = 'debug' ]; then
+    set -x
+fi
+
 # Set a default value for POSTGRES_PORT
 if [ -z "$POSTGRES_PORT" ]; then
     POSTGRES_PORT=5432
@@ -8,7 +12,7 @@ fi
 # Only start container if database is accessible
 # POSTGRES_HOST must be set in the containers env vars and POSTGRES_PORT has a default above
 # shellcheck disable=SC2153
-while ! sudo -u www-data nc -z "$POSTGRES_HOST" "$POSTGRES_PORT"; do
+while ! su-exec www-data nc -z "$POSTGRES_HOST" "$POSTGRES_PORT"; do
     echo "Waiting for database to start..."
     sleep 5
 done
@@ -17,10 +21,15 @@ done
 POSTGRES_USER="oc_$POSTGRES_USER"
 export POSTGRES_USER
 
+# Check that db type is not empty
+if [ -z "$DATABASE_TYPE" ]; then
+    export DATABASE_TYPE=postgres
+fi
+
 # Fix false database connection on old instances
 if [ -f "/var/www/html/config/config.php" ]; then
     sleep 2
-    while ! sudo -u www-data psql -d "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB" -c "select now()"; do
+    while ! su-exec www-data env PGPASSWORD="$POSTGRES_PASSWORD" psql -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "select now()"; do
         echo "Waiting for the database to start..."
         sleep 5
     done
@@ -48,15 +57,17 @@ if ! [ -f "/dev-dri-group-was-added" ] && [ -n "$(find /dev -maxdepth 1 -mindept
     usermod -aG "$GROUP" www-data
     touch "/dev-dri-group-was-added"
 fi
-set +x
+if [ "$AIO_LOG_LEVEL" != 'debug' ]; then
+    set +x
+fi
 
 # Check datadir permissions
-sudo -u www-data touch "$NEXTCLOUD_DATA_DIR/this-is-a-test-file" &>/dev/null
+su-exec www-data touch "$NEXTCLOUD_DATA_DIR/this-is-a-test-file" &>/dev/null
 if ! [ -f "$NEXTCLOUD_DATA_DIR/this-is-a-test-file" ]; then
     chown -R www-data:root "$NEXTCLOUD_DATA_DIR"
     chmod 750 -R "$NEXTCLOUD_DATA_DIR"
 fi
-sudo -u www-data rm -f "$NEXTCLOUD_DATA_DIR/this-is-a-test-file"
+su-exec www-data rm -f "$NEXTCLOUD_DATA_DIR/this-is-a-test-file"
 
 # Install additional dependencies
 if [ -n "$ADDITIONAL_APKS" ]; then
@@ -81,13 +92,15 @@ fi
 # Install additional php extensions
 if [ -n "$ADDITIONAL_PHP_EXTENSIONS" ]; then
     if ! [ -f "/additional-php-extensions-are-installed" ]; then
+        # Allow to disable imagick without having to enable it each time
+        if ! echo "$ADDITIONAL_PHP_EXTENSIONS" | grep -q imagick; then
+            # Remove the ini file as there is no docker-php-ext-disable script available
+            rm /usr/local/etc/php/conf.d/docker-php-ext-imagick.ini
+        fi
         read -ra ADDITIONAL_PHP_EXTENSIONS_ARRAY <<< "$ADDITIONAL_PHP_EXTENSIONS"
         for app in "${ADDITIONAL_PHP_EXTENSIONS_ARRAY[@]}"; do
             if [ "$app" = imagick ]; then
-                echo "Enabling Imagick..."
-                if ! docker-php-ext-enable imagick >/dev/null; then
-                    echo "Could not install PHP extension imagick!"
-                fi
+                # imagick is already enabled by default, so does not need to be enabled anymore.
                 continue
             fi
             # shellcheck disable=SC2086
@@ -140,7 +153,7 @@ if [ -n "$ADDITIONAL_PHP_EXTENSIONS" ]; then
 fi
 
 # Run original entrypoint
-if ! sudo -E -u www-data bash /entrypoint.sh; then
+if ! su-exec www-data bash /entrypoint.sh; then
     exit 1
 fi
 
@@ -163,6 +176,8 @@ if [ "$THIS_IS_AIO" = "true" ] && [ "$APACHE_PORT" = 443 ]; then
     sed -i "/^listen.allowed_clients/s/,$//" /usr/local/etc/php-fpm.d/www.conf
     grep listen.allowed_clients /usr/local/etc/php-fpm.d/www.conf
 fi
-set +x
+if [ "$AIO_LOG_LEVEL" != 'debug' ]; then
+    set +x
+fi
 
 exec "$@"

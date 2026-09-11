@@ -1,21 +1,26 @@
 # syntax=docker/dockerfile:latest
-# From https://github.com/docker-library/redis/blob/master/7.2/alpine/Dockerfile
-FROM redis:7.2.6-alpine
+# From https://github.com/redis/docker-library-redis/blob/release/8.2/alpine/Dockerfile
+FROM redis:8.10.1-alpine
 
 COPY --chmod=775 start.sh /start.sh
 
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 RUN set -ex; \
     apk upgrade --no-cache -a; \
-    apk add --no-cache openssl bash; \
-    \
-# Give root a random password
-    echo "root:$(openssl rand -base64 12)" | chpasswd; \
-    \
-# Get rid of unused binaries
-    rm -f /usr/local/bin/gosu;
+    apk add --no-cache bash
 
-USER redis
+COPY --chmod=775 healthcheck.sh /healthcheck.sh
+
+USER redis:redis
 ENTRYPOINT ["/start.sh"]
 
-HEALTHCHECK CMD redis-cli -a $REDIS_HOST_PASSWORD PING || exit 1
-LABEL com.centurylinklabs.watchtower.enable="false"
+HEALTHCHECK CMD ["/healthcheck.sh"]
+LABEL com.centurylinklabs.watchtower.enable="false" \
+    wud.watch="false" \
+    dockhand.update="false" \
+    org.opencontainers.image.title="Redis for Nextcloud AIO" \
+    org.opencontainers.image.description="Redis cache server for Nextcloud All-in-One" \
+    org.opencontainers.image.url="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.source="https://github.com/nextcloud/all-in-one" \
+    org.opencontainers.image.vendor="Nextcloud" \
+    org.opencontainers.image.documentation="https://github.com/nextcloud/all-in-one/blob/main/readme.md"

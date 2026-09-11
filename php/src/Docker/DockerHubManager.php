@@ -1,9 +1,8 @@
 <?php
+declare(strict_types=1);
 
 namespace AIO\Docker;
 
-use AIO\ContainerDefinitionFetcher;
-use AIO\Data\ConfigurationManager;
 use GuzzleHttp\Client;
 
 readonly class DockerHubManager {
@@ -14,6 +13,16 @@ readonly class DockerHubManager {
         $this->guzzleClient = new Client();
     }
 
+
+    // Official Docker Hub images need the library/ prefix when using the registry API directly.
+    private function normalizeImageName(string $name): string {
+        if (!str_contains($name, '/')) {
+            return 'library/' . $name;
+        }
+        return $name;
+    }
+
+
     public function GetLatestDigestOfTag(string $name, string $tag) : ?string {
         $cacheKey = 'dockerhub-manifest-' . $name . $tag;
 
@@ -23,6 +32,7 @@ readonly class DockerHubManager {
         }
 
         // If one of the links below should ever become outdated, we can still upgrade the mastercontainer via the webinterface manually by opening '/api/docker/getwatchtower'
+        $name = $this->normalizeImageName($name);
 
         try {
             $authTokenRequest = $this->guzzleClient->request(
@@ -30,7 +40,7 @@ readonly class DockerHubManager {
                 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:' . $name . ':pull'
             );
             $body = $authTokenRequest->getBody()->getContents();
-            $decodedBody = json_decode($body, true);
+            $decodedBody = json_decode($body, true, 512, JSON_THROW_ON_ERROR);
             if(isset($decodedBody['token'])) {
                 $authToken = $decodedBody['token'];
                 $manifestRequest = $this->guzzleClient->request(

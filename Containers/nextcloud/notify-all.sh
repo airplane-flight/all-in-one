@@ -1,7 +1,11 @@
 #!/bin/bash
 
+if [ "$AIO_LOG_LEVEL" = 'debug' ]; then
+    set -x
+fi
+
 if [[ "$EUID" = 0 ]]; then
-    COMMAND=(sudo -E -u www-data php /var/www/html/occ)
+    COMMAND=(su-exec www-data php /var/www/html/occ)
 else
     COMMAND=(php /var/www/html/occ)
 fi
@@ -20,7 +24,7 @@ mapfile -t NC_USERS <<< "$NC_USERS"
 for user in "${NC_USERS[@]}"
 do
     echo "Posting '$SUBJECT' to: $user"
-    "${COMMAND[@]}" notification:generate "$user" "$NC_DOMAIN: $SUBJECT" -l "$MESSAGE"
+    "${COMMAND[@]}" notification:generate "$user" "$NC_DOMAIN: $SUBJECT" -l "$MESSAGE" --object-type='update' --object-id="$SUBJECT"
 done
 
 echo "Done!"

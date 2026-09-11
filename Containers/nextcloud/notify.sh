@@ -1,7 +1,11 @@
 #!/bin/bash
 
+if [ "$AIO_LOG_LEVEL" = 'debug' ]; then
+    set -x
+fi
+
 if [[ "$EUID" = 0 ]]; then
-    COMMAND=(sudo -E -u www-data php /var/www/html/occ)
+    COMMAND=(su-exec www-data php /var/www/html/occ)
 else
     COMMAND=(php /var/www/html/occ)
 fi
@@ -28,7 +32,7 @@ done
 for admin in "${NC_ADMIN_USER[@]}"
 do
     echo "Posting '$SUBJECT' to: $admin"
-    "${COMMAND[@]}" notification:generate "$admin" "$NC_DOMAIN: $SUBJECT" -l "$MESSAGE"
+    "${COMMAND[@]}" notification:generate "$admin" "$NC_DOMAIN: $SUBJECT" -l "$MESSAGE" --object-type='update' --object-id="$SUBJECT"
 done
 
 echo "Done!"
